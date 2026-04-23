@@ -19,8 +19,44 @@ Grant:
 
 - **S3**: `s3:GetObject`, `s3:GetObjectTagging`, `s3:ListBucket` (scoped to source bucket/prefix).
 - **Bedrock**: `bedrock:InvokeModel` on your embedding model (e.g. `amazon.titan-embed-text-v2:0`).
+- **Secrets Manager**: `secretsmanager:GetSecretValue` for the ingestion secret.
 
-## 3. ECR
+## 3. Store ingestion config in AWS Secrets Manager
+
+Create the secret once:
+
+```bash
+aws secretsmanager create-secret \
+  --name ingestion/prod/config \
+  --description "Ingestion runtime configuration" \
+  --secret-string '{
+    "INGESTION_PINECONE_API_KEY":"pc-xxxx",
+    "INGESTION_PINECONE_INDEX_NAME":"ingestion-chunks",
+    "INGESTION_PINECONE_NAMESPACE":"default",
+    "INGESTION_PINECONE_CLOUD":"aws",
+    "INGESTION_PINECONE_REGION":"us-east-1",
+    "INGESTION_BEDROCK_EMBEDDING_MODEL_ID":"amazon.titan-embed-text-v2:0",
+    "INGESTION_EMBEDDING_DIMENSIONS":512
+  }'
+```
+
+Update it later with a new version:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id ingestion/prod/config \
+  --secret-string '{
+    "INGESTION_PINECONE_API_KEY":"pc-rotated-key",
+    "INGESTION_PINECONE_INDEX_NAME":"ingestion-chunks"
+  }'
+```
+
+At runtime, set:
+
+- `INGESTION_AWS_SECRETS_MANAGER_SECRET_ID=ingestion/prod/config`
+- `INGESTION_AWS_SECRETS_MANAGER_REGION=<region>`
+
+## 4. ECR
 
 ```bash
 aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
@@ -31,17 +67,35 @@ docker push <account>.dkr.ecr.<region>.amazonaws.com/ingestion:latest
 
 Use the same image for the CLI worker, batch jobs, or the FastAPI service; only the container **command** changes.
 
-## 4. Lambda + API Gateway
+## 5. GitHub Actions CI/CD secrets
+
+The workflow in `.github/workflows/ci.yml` expects these GitHub repository secrets:
+
+- `AWS_REGION`
+- `AWS_ROLE_TO_ASSUME` (OIDC IAM role ARN)
+- `ECR_REPOSITORY` (for example `ingestion`)
+
+Add them with GitHub CLI:
+
+```bash
+gh secret set AWS_REGION --body "us-east-1"
+gh secret set AWS_ROLE_TO_ASSUME --body "arn:aws:iam::<account-id>:role/github-actions-ecr-role"
+gh secret set ECR_REPOSITORY --body "ingestion"
+```
+
+Role trust policy must allow GitHub OIDC (`token.actions.githubusercontent.com`) for your repo.
+
+## 6. Lambda + API Gateway
 
 1. Package the repo (or a slim layer) so `PYTHONPATH` includes the project root and `ingestion` imports resolve.
 2. Set handler to `ingestion.lambda_handler.handler` (or copy `lambda_handler.py` to root and set `lambda_handler.handler`).
-3. Configure environment variables (`INGESTION_*`, `PINECONE_API_KEY`, `AWS_REGION`).
+3. Configure environment variables (`INGESTION_AWS_SECRETS_MANAGER_SECRET_ID`, `INGESTION_AWS_SECRETS_MANAGER_REGION`, `AWS_REGION`).
 4. Attach the ingestion IAM role.
 5. Create an HTTP API or REST API; integrate `POST` with the Lambda. Request body: `{"bucket":"...","key":"..."}`.
 
-## 5. EKS
+## 7. EKS
 
-### 5.1 Batch / CLI worker
+### 7.1 Batch / CLI worker
 
 1. Create a Kubernetes `ServiceAccount` with IRSA mapping to the ingestion IAM role.
 2. Run a `Job` or `Deployment` using the ECR image; override command, for example:
@@ -53,7 +107,7 @@ Use the same image for the CLI worker, batch jobs, or the FastAPI service; only 
 
 3. For large backfills, optionally drive work from **SQS** (S3 events → queue) and scale workers with **KEDA**.
 
-### 5.2 FastAPI (LangServe) — same ECR image
+### 7.2 FastAPI (LangServe) — same ECR image
 
 The default image `CMD` runs the worker help text. For HTTP ingestion, override the command so **uvicorn listens on all interfaces** (required inside the pod for `Service` / `Ingress` to reach the process):
 
@@ -61,8 +115,8 @@ The default image `CMD` runs the worker help text. For HTTP ingestion, override 
 command: ["uv", "run", "uvicorn", "ingestion.langserve_app:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-1. **Push** the image from [ECR](#3-ecr) above (for example `<account>.dkr.ecr.<region>.amazonaws.com/ingestion:latest`).
-2. **Configure** the pod with the same env vars as local runs: `PINECONE_API_KEY`, `INGESTION_*`, `AWS_REGION`, and any credentials your `IngestionSettings` expects (use `Secret` / External Secrets, not plain manifests).
+1. **Push** the image from [ECR](#4-ecr) above (for example `<account>.dkr.ecr.<region>.amazonaws.com/ingestion:latest`).
+2. **Configure** the pod with: `INGESTION_AWS_SECRETS_MANAGER_SECRET_ID`, `INGESTION_AWS_SECRETS_MANAGER_REGION`, `AWS_REGION`, and IAM permissions for `secretsmanager:GetSecretValue`.
 3. **Expose** the app with a `Service` on port **8000** (targeting container port 8000). Typical patterns:
    - **`LoadBalancer`** or **NLB**: use the provisioned hostname or IP as the base URL.
    - **`ClusterIP` + Ingress** (ALB Ingress Controller, NGINX, etc.): use the Ingress host and path rules you define.
@@ -129,7 +183,7 @@ spec:
 
 Change `type` and add an `Ingress` as needed for your cluster; keep **targetPort 8000** aligned with uvicorn.
 
-## 6. Optional: S3 → SQS → Lambda
+## 8. Optional: S3 → SQS → Lambda
 
 1. Configure S3 event notifications to an SQS queue (filter by prefix/suffix).
 2. Lambda consumes SQS messages; parse `Records[].s3.bucket.name` and `object.key` and call `ingest_object`.

@@ -1,13 +1,14 @@
-name: CI
+name: CI-CD
 
 on:
   push:
-    branches: [ main ]
+    branches: [ development, main ]
   pull_request:
-    branches: [ main ]
+    branches: [ development, main ]
+  workflow_dispatch:
 
 jobs:
-  test:
+  ci-tests:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,9 +28,45 @@ jobs:
           uv pip install pytest
       - name: Run tests
         env:
-          PYTHONPATH: ${{ github.workspace }}/ingestion
-          GROQ_API_KEY: dummy
-          GOOGLE_API_KEY: dummy
-          LLM_PROVIDER: google
+          PYTHONPATH: ${{ github.workspace }}
+          INGESTION_AWS_SECRETS_MANAGER_SECRET_ID: ci-placeholder-secret
+          INGESTION_AWS_SECRETS_MANAGER_REGION: us-east-1
+          INGESTION_PINECONE_API_KEY: test-key
+          INGESTION_PINECONE_INDEX_NAME: test-index
         run: |
           uv run pytest -q
+
+  docker-build-and-push:
+    if: github.event_name != 'pull_request'
+    needs: ci-tests
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -f ingestion/Dockerfile -t ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest

@@ -51,7 +51,13 @@ LangServe endpoints are mounted under `/ingest`, including:
 
 ## Key configuration
 
-`IngestionSettings` loads from `.env` and `INGESTION_` env vars.
+`IngestionSettings` loads from AWS Secrets Manager and `INGESTION_` env vars.
+Set the secret id with:
+
+- `INGESTION_AWS_SECRETS_MANAGER_SECRET_ID`
+- `INGESTION_AWS_SECRETS_MANAGER_REGION` (optional; defaults to `AWS_REGION`)
+
+Environment variables still override secret values when both are present.
 
 Required Pinecone settings:
 
@@ -67,6 +73,22 @@ Other important settings:
 - `INGESTION_EMBEDDING_DIMENSIONS`
 - `INGESTION_MAX_OBJECT_BYTES`
 - `INGESTION_BULK_BATCH_SIZE`
+
+### Example AWS secret payload
+
+Store a JSON object in Secrets Manager:
+
+```json
+{
+  "INGESTION_PINECONE_API_KEY": "pc-xxxx",
+  "INGESTION_PINECONE_INDEX_NAME": "ingestion-chunks",
+  "INGESTION_PINECONE_NAMESPACE": "default",
+  "INGESTION_PINECONE_CLOUD": "aws",
+  "INGESTION_PINECONE_REGION": "us-east-1",
+  "INGESTION_BEDROCK_EMBEDDING_MODEL_ID": "amazon.titan-embed-text-v2:0",
+  "INGESTION_EMBEDDING_DIMENSIONS": 512
+}
+```
 
 ## Huge file ingestion behavior
 

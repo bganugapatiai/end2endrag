@@ -1,30 +1,25 @@
 """
-Runtime configuration for ingestion via environment variables.
+Runtime configuration for ingestion.
 
 All settings support the ``INGESTION_`` prefix (e.g. ``INGESTION_PINECONE_INDEX_NAME``).
-See :class:`IngestionSettings` fields for the full list. Values can also be loaded
-from a ``.env`` file in the working directory when using pydantic-settings.
+See :class:`IngestionSettings` fields for the full list.
+
+Configuration sources (highest precedence first):
+1) Environment variables
+2) AWS Secrets Manager JSON secret (optional)
+3) Class defaults
 """
 
 from __future__ import annotations
 
 import os
 from functools import lru_cache
-from pathlib import Path
 from typing import Literal
 
+import boto3
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# pydantic-settings loads env_file paths relative to the *process* cwd, not this file.
-# Search common locations so `uv run` / IDE / `python -m ingestion.worker` all find `.env`.
-_HERE = Path(__file__).resolve().parent
-_REPO_ROOT = _HERE.parents[2]
-_ENV_CANDIDATES = (
-    _REPO_ROOT / ".env",
-    _HERE / ".env",
-    Path(".env"),
-)
+from pydantic_settings.sources import PydanticBaseSettingsSource
 
 
 class IngestionSettings(BaseSettings):
@@ -38,13 +33,13 @@ class IngestionSettings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="INGESTION_",
-        env_file=_ENV_CANDIDATES,
-        env_file_encoding="utf-8",
         env_nested_delimiter="__",
         extra="ignore",
     )
 
     aws_region: str = Field(default_factory=lambda: os.getenv("AWS_REGION", "us-east-1"))
+    aws_secrets_manager_secret_id: str | None = None
+    aws_secrets_manager_region: str | None = None
 
     # Pinecone index settings (accept PINECONE_API_KEY or INGESTION_PINECONE_API_KEY in .env)
     pinecone_api_key: str | None = Field(
@@ -99,6 +94,56 @@ class IngestionSettings(BaseSettings):
     # Bedrock embedding retries
     max_embedding_retries: int = 5
     embedding_backoff_base_seconds: float = 0.25
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ):
+        # Precedence: init args > env vars > AWS secret > defaults.
+        # dotenv_settings intentionally omitted so runtime does not depend on `.env`.
+        return (
+            init_settings,
+            env_settings,
+            cls._aws_secrets_settings_source,
+            file_secret_settings,
+        )
+
+    @classmethod
+    def _aws_secrets_settings_source(cls) -> dict[str, object]:
+        secret_id = os.getenv("INGESTION_AWS_SECRETS_MANAGER_SECRET_ID")
+        if not secret_id:
+            return {}
+
+        region = os.getenv("INGESTION_AWS_SECRETS_MANAGER_REGION") or os.getenv("AWS_REGION")
+        client = boto3.client("secretsmanager", region_name=region) if region else boto3.client("secretsmanager")
+        response = client.get_secret_value(SecretId=secret_id)
+        secret_string = response.get("SecretString")
+        if not secret_string:
+            return {}
+        return cls._normalize_secret_payload(secret_string)
+
+    @classmethod
+    def _normalize_secret_payload(cls, secret_string: str) -> dict[str, object]:
+        import json
+
+        raw = json.loads(secret_string)
+        if not isinstance(raw, dict):
+            raise ValueError("Secrets Manager secret must be a JSON object.")
+
+        normalized: dict[str, object] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                continue
+            lowered = key.lower()
+            if lowered.startswith("ingestion_"):
+                lowered = lowered[len("ingestion_") :]
+            normalized[lowered] = value
+        return normalized
 
     @property
     def resolved_index_name(self) -> str:

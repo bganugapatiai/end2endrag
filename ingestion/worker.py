@@ -37,7 +37,6 @@ def main() -> None:
     args = p.parse_args()
 
     settings = IngestionSettings()
-    print(settings.pinecone_api_key)
     if args.key:
         result = ingest_object(args.bucket, args.key, settings, ensure_index=True)
         print(json.dumps(result.__dict__, default=str))
