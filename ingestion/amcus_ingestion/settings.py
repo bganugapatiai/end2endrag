@@ -17,6 +17,7 @@ from functools import lru_cache
 from typing import Literal
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import PydanticBaseSettingsSource
@@ -120,9 +121,15 @@ class IngestionSettings(BaseSettings):
             return {}
 
         region = os.getenv("INGESTION_AWS_SECRETS_MANAGER_REGION") or os.getenv("AWS_REGION")
-        client = boto3.client("secretsmanager", region_name=region) if region else boto3.client("secretsmanager")
-        response = client.get_secret_value(SecretId=secret_id)
-        secret_string = response.get("SecretString")
+        try:
+            client = boto3.client("secretsmanager", region_name=region) if region else boto3.client("secretsmanager")
+            response = client.get_secret_value(SecretId=secret_id)
+            secret_string = response.get("SecretString")
+        except (NoCredentialsError, ClientError, BotoCoreError):
+            # Keep local dev/CI resilient when a secret id is configured but AWS
+            # credentials are intentionally unavailable.
+            return {}
+
         if not secret_string:
             return {}
         return cls._normalize_secret_payload(secret_string)
